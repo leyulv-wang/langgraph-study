@@ -48,7 +48,7 @@ def get_mcp_client() -> MultiServerMCPClient:
     _mcp_client = MultiServerMCPClient(connections=connections, tool_name_prefix=True)
     return _mcp_client
 
-#写一个异步的工具调用类
+#写一个异步的工具调用类，这个是自己写的，实际上可以使用langgraph提供的toolnode来实现，不过自定义不方便
 class BasicToolsNode:
     """
     异步工具节点，用于并发执行AIMessage中请求的工具调用
