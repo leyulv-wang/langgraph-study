@@ -3,6 +3,49 @@
 ## graph2.py：带 MCP 工具调用的小助手-异步
 ## graph3.py：带 MCP 工具调用的小助手-使用langgraph官方工具toolnode节点
 ## graph4.py：带 MCP 工具调用的小助手-使用langgraph官方工具toolnode节点，加入人工干预中断的内容
+## graph5.py：带 MCP 工具调用的小助手-使用langgraph官方工具toolnode节点，加入人工干预中断的内容，使用库里的interrupt函数
+
+## 项目思路，重点
+### 线性设计流程（从需求到实现，LangGraph 通用架构）
+下面用“因为 A，所以设计 a（a 的作用是什么）”的方式，把 graph5 的架构按工程化顺序串起来：
+
+1) 因为需要一个“可编排的工作流”（而不是一段 if/else 代码），所以选择 StateGraph
+- 作用：用节点（node）表达职责、用边（edge）表达顺序/分支，得到一个可运行、可观察、可扩展的流程。
+- 对应实现：`StateGraph(State)`，再 `add_node/add_edge/add_conditional_edges`，最后 `compile()`。
+
+2) 因为每个节点都需要共享“对话上下文”，所以状态以 MessagesState 为核心
+- 作用：用 `state["messages"]` 贯穿整个图，让 LLM 和工具都在同一段消息历史上工作。
+- 对应实现：`class State(MessagesState)`。
+
+3) 因为要让模型“自己决定何时用工具”，所以需要把 tools 绑定到模型
+- 作用：`llm.bind_tools(tools)` 让模型在需要时产出 `tool_calls`，把“工具选择”交给模型推理。
+- 对应实现：`chatbot` 节点里选择调用 `llm_with_tools.ainvoke(messages)`。
+
+4) 因为工具不是写死在代码里（要可替换、可扩展），所以引入 MCP 来动态提供工具
+- 作用：把“工具来源”抽象为外部服务（MCP server），通过配置接入不同工具集（12306 / chart / fetch）。
+- 对应实现：`.env` 配置连接信息；`get_mcp_client()` 构建 `MultiServerMCPClient`；`create_graph()` 拉取 tools 列表。
+
+5) 因为工具调用是一个独立职责（执行、并发、格式化结果、错误处理），所以把它做成单独的工具节点
+- 作用：把“执行 tool_calls → 产出 ToolMessage”封装成一个节点，chatbot 不需要关心调用细节。
+- 对应实现：`BasicToolsNode.__call__` 读取最后一条 AIMessage 的 `tool_calls`，然后 `_execute_tool_calls` 并发执行并返回 `ToolMessage`。
+
+6) 因为不是所有工具都需要人工确认，所以需要一个“可配置的中断规则”
+- 作用：把“哪些工具要中断”写成配置（而不是散落在代码逻辑里），方便你学习和扩展。
+- 对应实现：`_INTERRUPT_TOOL_NAME_PREFIXES`（tool name 前缀匹配），命中则在工具节点里触发 `interrupt(...)`。
+
+7) 因为你希望“暂停后还能继续”，所以需要 interrupt + resume 的运行时控制
+- 作用：`interrupt()` 让图在节点内部“暂停”；`Command(resume=...)` 把用户输入回填给图，让图从中断点继续执行。
+- 对应实现：工具节点里 `response = interrupt(...)`；`run_graph()` 里检测返回 dict 的 `__interrupt__`，再 `graph.ainvoke(Command(resume=resume), ...)`。
+
+8) 因为暂停/恢复需要状态可追踪（否则不知道从哪继续），所以必须使用 checkpointer + thread_id
+- 作用：把当前线程的状态存下来，resume 时才能定位到正确的中断点继续跑。
+- 对应实现：`MemorySaver()` + `config={"configurable": {"thread_id": "123456"}}`。
+
+9) 因为“拒绝工具”不能破坏消息协议，也不能让模型继续反复要工具，所以需要两件事：补 ToolMessage + 写入拒绝状态
+- 作用（补 ToolMessage）：当 AIMessage 里有 `tool_calls` 时，必须有对应 `tool_call_id` 的 ToolMessage，否则后续模型调用会 400。
+- 作用（写入拒绝状态）：把 `tool_use_allowed=False`、`tool_use_denied_reason=...` 写入状态，让 chatbot 后续改用“纯模型”回答（不再生成 tool_calls）。
+- 对应实现：拒绝时返回“拒绝 ToolMessage”并更新 `tool_use_allowed/tool_use_denied_reason`；`chatbot` 节点读取该标志决定用不用 tools。
+
 这个目录包含两个独立的 LangGraph 工作流示例：
 
 综合来说，graph的设计流程思路：
@@ -126,3 +169,118 @@
 
 ### 最终导出 LangGraph 对象，用于执行
 `agent = asyncio.run(create_graph())` 导出编译后的图对象，供 `langgraph.json` 引用加载。
+
+## graph4.py：带 MCP 工具调用的小助手（加入人工干预中断）
+
+### 核心目标
+在 graph3 的“模型 ↔ 工具”的自动循环基础上，加上一个“人工确认”机制：
+
+- 模型一旦产生 `tool_calls`，先不要立刻执行工具
+- 先停下来，让用户决定：输入 `y` 才继续执行；否则输入拒绝原因，让模型不调用工具、直接给替代回答
+
+### 为什么 graph4 需要 checkpointer + thread_id
+`interrupt_before=["tools"]` 的中断/恢复依赖检查点保存状态：
+
+- 第一次运行到工具节点前会中断，此时图必须把当前 `messages` 等状态写入 checkpointer
+- 恢复时用 `graph.ainvoke(None, config=...)` 从上一次中断位置继续
+- `config={"configurable": {"thread_id": "..."}}` 用来标识“这一次对话线程”的检查点归属，否则无法恢复到正确的那一次中断
+
+graph4 默认用 `MemorySaver()`（内存检查点）方便本地跑通；以后也可以替换成 Postgres 等持久化 checkpointer。
+
+### 工具节点为什么用 ToolNode + tools_condition
+graph4 采用 LangGraph 内置的工具方案（比 graph2 自己写工具节点更省心）：
+
+- `ToolNode(tools, awrap_tool_call=...)`：负责把 `tool_calls` 真正执行成 `ToolMessage`
+- `tools_condition`：官方的路由函数，判断最后一条 AIMessage 是否包含 `tool_calls`
+  - 有 `tool_calls` → 进入 `tools`
+  - 没有 `tool_calls` → END
+
+另外，`awrap_tool_call` 的作用是“兜底把工具返回值转成字符串”，避免某些工具返回 dict/list 时触发模型接口 400（因为 ToolMessage.content 必须是字符串）。
+
+### 人工干预分支为什么要补 ToolMessage（关键坑）
+当你“拒绝执行工具”时，历史里依然存在一条带 `tool_calls` 的 AIMessage。
+OpenAI 协议有硬性要求：
+
+- 如果某条 assistant 消息带 `tool_calls`
+- 后面必须紧跟每个 `tool_call_id` 对应的 `ToolMessage`
+
+否则下一次再调用模型，就会报错：
+`An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'`
+
+所以 graph4 在拒绝分支里会为每个 pending 的 `tool_call_id` 追加一条“拒绝执行”的 `ToolMessage`，把对话历史修正成合法结构，然后再让模型生成“不用工具的替代回答”。
+
+### 本地运行方式（run_graph）
+`run_graph()` 做了一个最小 CLI 交互循环：
+
+1. 输入正常问题 → 运行图
+2. 如果检测到 `tool_calls` → 提示“输入 y 执行工具，否则输入拒绝原因”
+3. 输入 `y` → `graph.ainvoke(None, config=...)` 从中断点继续执行工具
+4. 输入其他文字 → 走拒绝分支：补 ToolMessage → 让模型直接回答 → 写回状态，继续下一轮对话
+
+## graph5.py：用 interrupt() 对“特定工具”做人工中断（工程化拆解）
+
+### 你要实现的能力（需求）
+在“模型会自动决定调用工具”的前提下，你希望对某些敏感/昂贵/有风险的工具做人工确认：
+
+- 命中特定工具 → 先暂停（interrupt）→ 用户输入 y 才执行
+- 用户拒绝 → 不执行工具，但把“拒绝信息”写进状态，并且后续不要再走工具调用
+
+
+### 这份代码需要哪些部件（模块化视角）
+把 graph5 当成一个小框架来看，它由 6 个部件拼起来：
+
+1) 配置层（Config）
+- `.env`：提供 MCP 服务地址、模型配置等
+- `_INTERRUPT_TOOL_NAME_PREFIXES`：定义“哪些工具需要人工确认”（通过 tool name 前缀匹配）
+
+2) 集成层（Integration）
+- `get_mcp_client()`：把 `.env` 里的连接信息组装成 `MultiServerMCPClient`，并做模块级缓存复用
+- `create_graph()`：从多个 server 拉取 tools 列表，交给模型绑定
+
+3) 状态层（State）
+- `State(MessagesState)`：核心是 `messages`（对话上下文）
+- 额外状态字段（工程上建议显式化）：`tool_use_allowed` / `tool_use_denied_reason`
+  - `tool_use_allowed=False`：表示用户已拒绝工具，本线程后续应禁用工具
+  - `tool_use_denied_reason`：记录拒绝原因，方便后续回答引用
+
+4) 编排层（Orchestration）
+- `StateGraph(State)`：把节点和边组织起来
+- `MemorySaver()`：作为 checkpointer，确保 interrupt 后可以 resume
+- `config={"configurable": {"thread_id": "..."} }`：为同一线程的恢复提供定位
+
+5) 节点层（Nodes）
+- `chatbot`：调用 LLM 生成 AIMessage
+  - `tool_use_allowed=False` 时用“纯模型”（不绑定 tools）回答，确保不会再产生 tool_calls
+  - 否则用 `llm.bind_tools(tools)` 让模型按需产生 tool_calls
+- `tool_node(BasicToolsNode)`：执行工具调用（并且负责在必要时触发 interrupt）
+
+6) 控制层（Control Flow）
+- `route_tools_func`：检查最后一条 AIMessage 是否有 `tool_calls`
+  - 有 → 进入 `tool_node`
+  - 无 → END
+- `run_graph()`：负责处理 interrupt 的“暂停/恢复”交互
+
+### 运行时的数据流（从 START 到 END）
+整体就是一个循环：
+
+1. `START → chatbot`
+2. `chatbot` 产出 AIMessage
+3. `route_tools_func` 分支：
+   - 没有 `tool_calls` → `END`
+   - 有 `tool_calls` → `tool_node`
+4. `tool_node` 做三种分支：
+   - 不需要中断（不匹配前缀）→ 直接执行工具 → 返回 ToolMessage
+   - 需要中断且用户输入 y → 执行工具 → 返回 ToolMessage
+   - 需要中断且用户拒绝 → 不执行工具 → 返回“拒绝 ToolMessage”，并写入 `tool_use_allowed=False`
+5. `tool_node → chatbot`，模型看到 ToolMessage 后继续生成最终回答/继续请求下一轮工具
+
+### interrupt 的关键点：为什么需要 run_graph 循环处理 __interrupt__
+`interrupt(value)` 不会像 `input()` 一样直接在 Python 里阻塞等待，它会让图返回一个特殊字段：
+
+- 返回值 dict 里包含 `__interrupt__`
+- 你在 `run_graph()` 里检查到它，就提示用户输入
+- 再用 `graph.ainvoke(Command(resume=用户输入), config=...)` 把输入“喂回去”，让图从中断点继续跑
+
+### 拒绝工具为什么要生成 ToolMessage（避免协议错误）
+当 AIMessage 里有 `tool_calls` 时，消息历史里必须出现对应 `tool_call_id` 的 ToolMessage。
+所以即使你拒绝执行工具，也要生成“拒绝执行”的 ToolMessage，把对话历史补齐成合法结构。
