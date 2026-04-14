@@ -1,0 +1,16 @@
+{
+  "python.defaultInterpreterPath": "D:\\anaconda3\\envs\\langgraph\\python.exe",
+  "python-envs.defaultEnvManager": "ms-python.python:conda",
+  "python-envs.defaultPackageManager": "ms-python.python:conda",
+  "terminal.integrated.profiles.windows": {
+    "PowerShell (langgraph_demo env)": {
+      "path": "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "args": [
+        "-NoExit",
+        "-Command",
+        "& 'C:\\Users\\Administrator\\anaconda3\\shell\\condabin\\conda-hook.ps1' ; conda activate langgraph"
+      ]
+    }
+  },
+
+}

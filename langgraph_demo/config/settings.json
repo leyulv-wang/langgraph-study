@@ -1,0 +1,38 @@
+{
+  "github": {
+    "base_url": "https://api.github.com",
+    "default_topics": ["ai", "machine-learning", "llm", "agents", "rag"],
+    "default_languages": [],
+    "default_limit": 20,
+    "request_timeout_sec": 20,
+    "max_pages": 5
+  },
+  "news": {
+    "request_timeout_sec": 20,
+    "sources": [
+      {
+        "name": "TechCrunch AI",
+        "type": "rss",
+        "url": "https://techcrunch.com/tag/artificial-intelligence/feed/"
+      },
+      {
+        "name": "arXiv cs.AI",
+        "type": "atom",
+        "url": "http://export.arxiv.org/api/query?search_query=cat:cs.AI&sortBy=submittedDate&sortOrder=descending&max_results=30"
+      },
+      {
+        "name": "arXiv cs.LG",
+        "type": "atom",
+        "url": "http://export.arxiv.org/api/query?search_query=cat:cs.LG&sortBy=submittedDate&sortOrder=descending&max_results=30"
+      }
+    ]
+  },
+  "output": {
+    "default_format": "markdown"
+  },
+  "limits": {
+    "github_requests_per_minute": 30,
+    "news_requests_per_minute": 30
+  }
+}
+
